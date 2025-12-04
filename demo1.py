@@ -7,7 +7,7 @@ import numpy as np
 # --- LangChain Imports ---
 from langchain_community.document_loaders import DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_core.documents import Document
 from langchain_community.retrievers import BM25Retriever
@@ -43,7 +43,7 @@ class GraphState(TypedDict):
 class RAGPipeline:
     
     def __init__(self):
-        print("--- 1. RUNNING STARTUP (OLLAMA + REWRITE + MULTI-USER) ---")
+        print("[Startup]: RUNNING STARTUP (OLLAMA + REWRITE + MULTI-USER)")
         
         # --- Configuration ---
         self.OLLAMA_BASE_URL = "http://localhost:11434"
@@ -51,7 +51,7 @@ class RAGPipeline:
         self.EMBED_MODEL_NAME = "nomic-embed-text:latest" 
         
         self.DATA_DIR = "data"
-        self.CHROMA_DIR = "./chroma_db_ollama"
+        self.CHROMA_DIR = "./chroma_db"
         
         # Multi-User Cache Directory
         self.CACHE_DIR = "user_caches"
@@ -78,13 +78,14 @@ class RAGPipeline:
         self.documents = self.load_documents(self.DATA_DIR) or []
         if self.documents:
             self.chunks = self.chunk_documents(self.documents)
+            print(f"[Chunks]: Total documents loaded: {len(self.documents)}. Total chunks created: {len(self.chunks)}.")
         else:
-            print("Warning: No documents found in 'data' folder. Please add .txt files there.")
+            print(f"[Chunks]: Warning: No documents found in 'data' folder. Please add .txt files there.")
             self.chunks = []
         
         # --- Setup Retrievers ---
         if self.chunks:
-            print("Setting up retrievers (BM25 + Chroma)...")
+            print("[Retreiver]: Setting up retrievers (BM25 + Chroma)...")
             self.bm25_retriever = BM25Retriever.from_documents(self.chunks)
             self.bm25_retriever.k = self.RETRIEVER_TOP_K
             self.vector_store = self.create_vector_store(self.chunks)
@@ -95,7 +96,7 @@ class RAGPipeline:
         # --- Memory & Graph ---
         self.memory = MemorySaver() 
         self.app = self.create_langgraph_workflow()
-        print("--- STARTUP COMPLETE. Pipeline is ready. ---")
+        print("[Pipeline]: STARTUP COMPLETE. Pipeline is ready.")
 
     # --- Helper Methods ---
     
@@ -113,8 +114,13 @@ class RAGPipeline:
         )
 
     def load_documents(self, folder_path):
-        try: return DirectoryLoader(folder_path, glob="**/*.txt").load()
-        except: return None
+        try:
+            docs = DirectoryLoader(folder_path, glob="**/*.txt").load()
+            print("[Data]: Data loaded from files")
+            return docs
+        except Exception as e: 
+            print(f"[Data]: Error while loading files {e}")
+            return None
 
     def chunk_documents(self, documents):
         return self.text_splitter.split_documents(documents)
@@ -126,8 +132,10 @@ class RAGPipeline:
             collection_name="rag_collection"
         )
         if vector_store._collection.count() == 0: 
-            print(f"Indexing {len(chunks)} chunks into ChromaDB...")
+            print(f"[Indexing]: creating index of {len(chunks)} chunks into ChromaDB...")
             vector_store.add_documents(chunks)
+        else:
+            print(f"[Indexing]: ChromaDB index already exists with {vector_store._collection.count()} vectors.")
         return vector_store
 
     def get_user_cache_path(self, user_id):
@@ -161,7 +169,6 @@ class RAGPipeline:
 
     def check_cache_node(self, state: GraphState):
         """NODE 1: CACHE LOOKUP"""
-        print("---NODE 1: CACHE LOOKUP---")
         
         user_id = state["user_id"]
         messages = state["messages"]
@@ -183,7 +190,7 @@ class RAGPipeline:
         # 2. Check Cache (Exact match on original question)
         if original_question in user_cache_data:
              cached_answer = user_cache_data[original_question]["answer"]
-             print(f"--- CACHE HIT for User '{user_id}' ---")
+             print(f"[Cache]: CACHE HIT for User '{user_id}' ---")
              return {
                  "answer": cached_answer, 
                  "cache_hit": True, 
@@ -201,14 +208,13 @@ class RAGPipeline:
 
     def rewrite_query_node(self, state: GraphState):
         """NODE 2: REWRITE QUERY (Improve context)"""
-        print("---NODE 2: REWRITE QUERY---")
         
         question = state["question"]
         messages = state["messages"]
         
         # If no history (len <= 1), user just started. No need to rewrite.
         if len(messages) <= 1:
-            print("No history, skipping rewrite.")
+            print("[Rewrite]: No history, skipping rewrite.")
             return {"question": question}
 
         # Prompt for Rewriting
@@ -238,14 +244,13 @@ class RAGPipeline:
         response = self.llm.invoke(msg)
         rewritten_query = response.content.strip()
         
-        print(f"Original: {question} \nRewritten: {rewritten_query}")
+        print(f"[Rewrite]: Original: {question} \nRewritten: {rewritten_query}")
         
         # We update 'question' so the next node (retrieval) uses the better version
         return {"question": rewritten_query}
 
     def context_generation_node(self, state: GraphState):
         """NODE 3: RETRIEVAL"""
-        print("---NODE 3: RETRIEVAL & RRF---")
         question = state["question"] # This is now the REWRITTEN question
         
         # Embed the rewritten question
@@ -264,12 +269,12 @@ class RAGPipeline:
         # 2. RRF
         fused_docs = self.reciprocal_rank_fusion([bm25_docs, chroma_docs])
         final_docs = fused_docs[:self.FINAL_TOP_K]
+        print(f"[Context]: {final_docs}")
         
         return {"documents": final_docs, "query_embedding": query_embedding}
 
     def response_generation_node(self, state: GraphState):
         """NODE 4: GENERATION"""
-        print("---NODE 4: GENERATION---")
         documents = state["documents"]
         
         context_str = "\n\n".join([f"[Doc {i+1}]: {doc.page_content}" for i, doc in enumerate(documents)])
@@ -316,8 +321,9 @@ class RAGPipeline:
             try:
                 with open(user_cache_path, 'w') as f:
                     json.dump(current_cache, f, indent=2)
+                    print(f"\n[Cache]: Cache saved successfully for User '{user_id}'.")
             except Exception as e:
-                print(f"Cache save failed: {e}")
+                print(f"\n[Cache]: Cache save failed: {e}")
         return {}
 
     # --- Graph Definition ---
@@ -355,7 +361,6 @@ class RAGPipeline:
 
     # --- Run Method ---
     def run_chat(self):
-        print("\n--- RAG Pipeline (Ollama + Multi-User + Rewrite) Ready ---")
         
         current_user_id = input("Enter User ID (e.g., 'alice', 'bob'): ").strip()
         if not current_user_id: current_user_id = "default_user"
@@ -391,9 +396,7 @@ class RAGPipeline:
                             final_answer = current_content
                             
             except Exception as e:
-                print(f"Error during execution: {e}")
-            
-            print() 
+                print(f"Error during execution: {e}") 
 if __name__ == "__main__":
     try:
         pipeline = RAGPipeline()
